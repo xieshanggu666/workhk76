@@ -23,7 +23,13 @@ from .forging import FORGE_COST, effective_card, node_name, growth_node_cost, va
 # 2.2.0：远征委托（commissions/chapter/chapters_total 进入 run 状态与交接快照）。
 # 2.3.0：卡牌成长树（带前置条件与互斥分支的 DAG 取代三分支可重复锻造；
 #        实例 forges:[分支] -> growth:[{node,cost}]；旧档与旧日志确定性迁移）。
-RULES_VERSION = "2.3.0"
+# 2.4.0：修复跨章交接的章号归属 bug——交接快照 carry 里携带的 chapter 是「来源章」，
+#        开新章时必须以显式入参（新章号）为准；旧实现误用 carry 的章号，导致第 2 章
+#        及以后的 run 状态章号恒为 1，委托挂单 deadline、剩余期限、领奖记录全部错乱。
+#        受影响的旧存档首次载入时按权威 runs.chapter 列修复（委托章号/期限/领奖位置/
+#        被误判超期的进行中委托一并校正）；旧日志回放走兼容修复（修复前步骤按 legacy
+#        跳过逐位哈希比对，最终状态与在线修复后的存档一致）。
+RULES_VERSION = "2.4.0"
 GROWTH_RULES_VERSION = "2.3.0"  # 成长树规则起始版本：更早的 forge 日志走兼容重演
 
 
@@ -81,7 +87,10 @@ def _new_run_state(seed, carry=None, chapter=None, chapters_total=None, expediti
     carry 非 None（远征章节 run）时以交接快照为起点：牌组（含锻造成长）、遗物、
     金币、生命/能量上限、远征委托全部带入新章，并按 CHAPTER_CLEAR_HEAL_RATIO
     休整回血；进入新章时超期委托在调用方推进（advance）处理。
-    chapter/chapters_total/expedition_id 为远征章节 run 的归属信息（普通局为 None）。
+    chapter/chapters_total/expedition_id 为新章 run 的归属信息（普通局为 None）——
+    这是新 run 自身的身份，必须以显式入参为准；carry 里同名字段是「交接快照来源章」
+    的记录，只用于历史快照，绝不能覆盖新章号（否则第 2 章及以后的 run 章号恒为 1，
+    委托挂单 deadline/剩余期限/领奖记录全部错乱）。
     同一组入参必得同一初始状态——在线开章与回放重建共用本函数，天然一致。
     """
     if carry is None:
@@ -115,10 +124,12 @@ def _new_run_state(seed, carry=None, chapter=None, chapters_total=None, expediti
         # 远征委托：uid 单调发号器 + 委托实例（接取/进度/领奖/超期/战败失败）
         "next_commission_seq": carry.get("next_commission_seq", 1),
         "commissions": copy.deepcopy(carry.get("commissions", [])),
-        # 远征归属（普通局均为 None）；委托挂单/限章判断依赖章号与总章数
+        # 远征归属（普通局均为 None）：新章 run 的身份只认真实入参；carry 的
+        # chapter/chapters_total 是来源章快照，不参与新 run 的身份判定。
         "expedition_id": expedition_id,
-        "chapter": carry.get("chapter", chapter),
-        "chapters_total": carry.get("chapters_total", chapters_total),
+        "chapter": chapter if chapter is not None else carry.get("chapter"),
+        "chapters_total": (chapters_total if chapters_total is not None
+                           else carry.get("chapters_total")),
         "in_battle": False,
         "battle_index": 0,
         "battle": None,
@@ -438,6 +449,249 @@ def _ensure_expedition_fields_conn(conn, run, rec):
             run["chapters_total"] = row["chapters_total"]
 
 
+# ---------- 旧版跨章委托修复（2.4.0 之前的受影响存档/日志） ----------
+def _commission_duration(c, at_chapter, chapters_total):
+    """从一条委托的（已损坏）deadline 反推原始挂单时限跨度 duration（确定性）。
+
+    旧实现下所有章节 run 的状态章号恒为 1，因此挂单 deadline=min(total,1+duration)：
+    deadline<total 时 duration=deadline-1；deadline==total 时 duration 可能是
+    total-1 或 MAX_DURATION 中任一被截断的值——二者修复后算出的 deadline 仍同为
+    total（min 截断），所以取 total-1 即可逐位还原。
+    """
+    dl = c.get("deadline_chapter", at_chapter)
+    duration = max(1, dl - 1)
+    if chapters_total is not None and dl >= chapters_total:
+        duration = max(duration, chapters_total - 1)
+    return duration
+
+
+def _repair_commissions_pure(commissions, cur_chapter, chapters_total,
+                             accepted_chapter=None, claimed_chapter=None,
+                             carry_ids=None, carry_boundary=None,
+                             revive_chapter=None):
+    """把 2.4.0 之前跨章 run 里被错误章号污染的委托就地修复为一致状态。
+
+    旧实现下第 2 章及以后的 run 状态章号恒为 1，因此「在第 2 章及以后接取」的挂单
+    deadline 被错误地按「章号 1」计算（旧值=min(total,1+duration)）；第 1 章接取的
+    委托状态章号本就正确，deadline 是真值，绝不改动（含真实超期失败）。
+    对真实接取章>=2 的委托，duration 可由存储 deadline 反推（dl<total ->
+    duration=dl-1；dl==total 被截断时取 total-1，修复后 min 截断结果相同），按真实
+    接取章重算：deadline' = min(total, accepted_chapter + duration)。
+    - accepted_chapter：交接快照边界映射（真实接取章）；缺失时用 carry_boundary
+      （本章 create 事件入章快照 cid->commission）；再缺失 -> 当前章（本章新接取）；
+    - claimed_chapter：cid -> 真正领奖章，修正 claimed_at 章号前缀；
+    - revive_chapter 非 None 时，仅对「真实接取章>=2（确受 bug 影响）、被旧超期
+      判定 failed(expired)、但修复后 deadline 仍 >= revive_chapter」的带入委托
+      撤销误判（恢复进行中）；第 1 章接取的失败终态保持不变。
+    返回发生变化的委托 id 列表。
+    """
+    carry_ids = set(carry_ids or ())
+    accepted_chapter = accepted_chapter or {}
+    claimed_chapter = claimed_chapter or {}
+    carry_boundary = carry_boundary or {}
+    changed = []
+
+    def true_accepted_chapter(cid):
+        if accepted_chapter.get(cid) is not None:
+            return accepted_chapter[cid]
+        bc = carry_boundary.get(cid)
+        if bc is not None and bc.get("accepted_chapter") is not None:
+            return bc["accepted_chapter"]
+        return cur_chapter          # 本章新接取
+
+    for c in commissions:
+        cid = c["id"]
+        before = copy.deepcopy(c)
+        at_ch = true_accepted_chapter(cid)
+        c["accepted_chapter"] = at_ch
+        if chapters_total is not None and at_ch >= 2:
+            # 仅第 2 章及以后接取的挂单被旧错误章号锚定，按真实接取章重算期限
+            duration = _commission_duration(c, at_ch, chapters_total)
+            c["deadline_chapter"] = min(chapters_total, at_ch + duration)
+        # 撤销被旧逻辑误判的超期失败：只救真实接取章>=2、修复后仍未到期的带入委托；
+        # 第 1 章接取的 deadline 从未被污染，其超期失败是真实终态，不复活。
+        if (revive_chapter is not None and cid in carry_ids and at_ch >= 2
+                and c.get("status") == commission_mod.FAILED
+                and c.get("fail_reason") == "expired"
+                and c["deadline_chapter"] >= revive_chapter):
+            c["status"] = commission_mod.ACTIVE
+            c["fail_reason"] = None
+        # 领奖记录的章节前缀：claimed_at 形如 "chapter:<章号>:<节点>"
+        claimed_at = c.get("claimed_at")
+        if claimed_at and cid in claimed_chapter:
+            parts = claimed_at.split(":", 2)
+            if len(parts) == 3 and parts[0] == "chapter":
+                c["claimed_at"] = f"chapter:{claimed_chapter[cid]}:{parts[2]}"
+        if c != before:
+            changed.append(cid)
+    return changed
+
+
+def reanchor_shop_commission_offers(shop, chapter, chapters_total):
+    """把商店货架上尚未接取的委托挂单按真实当前章重新锚定期限。
+
+    旧实现下章号恒为 1，挂单 deadline=min(total,1+duration)；duration 可由存储
+    deadline 反推，与委托同款逐位还原。货架卡牌/遗物/交易记录不受影响。
+    """
+    if not isinstance(shop, dict):
+        return
+    for o in shop.get("commission_offers", []) or []:
+        o["offered_chapter"] = chapter
+        if chapters_total is not None:
+            dl = o.get("deadline_chapter", chapter)
+            duration = max(1, dl - 1)
+            if dl >= chapters_total:
+                duration = max(duration, chapters_total - 1)
+            o["deadline_chapter"] = min(chapters_total, chapter + duration)
+
+
+def _commission_chapter_maps_conn(conn, exp_id):
+    """扫描远征事件与各章动作日志，确定性建立委托的接取章/领奖章映射。
+
+    返回 (accepted_map, claimed_map)：
+    - accepted_map[cid]：真实接取章 = 委托最早出现的「章节结束快照」来源章。
+      chapter_clear 事件的 carry 是该章刚通关时（advance 超期判定之前）的快照，
+      章号即来源章；advance 事件的 carry 来自上一章（事件章号-1）。优先采用
+      chapter_clear，advance 仅在没有对应 clear 时兜底（取最早来源章）。
+    - claimed_map[cid]：真正领奖章（各章 commission_claim 日志，按章序首次出现）。
+    只在本章接取、从未进过任何 carry 的委托不在映射中（调用方按「当前章接取」处理）。
+    """
+    accepted, claimed = {}, {}
+    # 先收集 chapter_clear（接取章末、advance 前的权威快照），再用 advance 兜底
+    for prefer_clear in (True, False):
+        for e in db.load_expedition_events(exp_id):
+            p = e.get("payload") or {}
+            if not isinstance(p, dict) or not isinstance(p.get("carry"), dict):
+                continue
+            if (e["kind"] == "chapter_clear") != prefer_clear:
+                continue
+            ev_ch = p.get("chapter")
+            origin = ev_ch - 1 if (e["kind"] == "advance" and ev_ch) else ev_ch
+            if not origin:
+                continue
+            for c in p["carry"].get("commissions", []):
+                cid = c.get("id")
+                if cid and cid not in accepted:
+                    accepted[cid] = origin
+    rows = conn.execute(
+        "SELECT be.payload_json AS pj, r.chapter AS ch FROM battle_events be "
+        "JOIN runs r ON r.id = be.run_id "
+        "WHERE r.expedition_id=? AND be.action='commission_claim' ORDER BY r.chapter, be.seq",
+        (exp_id,),
+    ).fetchall()
+    for r in rows:
+        try:
+            p = json.loads(r["pj"])
+        except (ValueError, TypeError):
+            continue
+        cid = p.get("commission") if isinstance(p, dict) else None
+        if cid and r["ch"] is not None:
+            claimed.setdefault(cid, r["ch"])
+    return accepted, claimed
+
+
+def _repair_expedition_carry_conn(conn, exp_row, origin_chapter, accepted_chapter,
+                                  claimed_chapter, revive=True):
+    """修复远征表交接快照：把 carry.chapter 校正为来源章，并对其中的委托做同款修复。
+
+    carry 是「origin_chapter 章结束」的快照，其中每个委托都是在 origin 或更早章
+    接取的（没有「origin+1 章新接取」），因此一律按跨章带入处理、用边界映射确定
+    真实接取章并按反推 duration 重算期限。revive=True 时撤销进入下一章
+    （origin+1）被旧逻辑误判超期的进行中委托；终章结算快照 revive=False 不复活。
+    返回修复后的 carry（无快照时原样返回）。
+    """
+    carry = exp_row["carry"]
+    if not isinstance(carry, dict):
+        return carry
+    carry_ids = {c["id"] for c in carry.get("commissions", [])}
+    if carry.get("chapter") != origin_chapter:
+        carry["chapter"] = origin_chapter
+    _repair_commissions_pure(
+        carry.get("commissions", []), origin_chapter, exp_row["chapters_total"],
+        accepted_chapter=accepted_chapter, claimed_chapter=claimed_chapter,
+        carry_ids=carry_ids,
+        revive_chapter=(origin_chapter + 1 if revive else None))
+    conn.execute("UPDATE expeditions SET carry_json=?, updated_at=datetime('now') WHERE id=?",
+                 (json.dumps(carry, ensure_ascii=False), exp_row["id"]))
+    return carry
+
+
+def _repair_expedition_chapter_run_conn(conn, run, rec):
+    """受影响旧档（2.4.0 前跨章 run）首次载入时的一致性修复。
+
+    旧实现把 carry 的来源章号当成新 run 的章号：第 2 章及以后的 run 状态里
+    chapter 恒为旧值，进而委托挂单 deadline、剩余期限、领奖位置章号、跨章超期
+    判定全部错乱。runs.chapter 列（开章/推进时由远征状态权威写入）始终正确，
+    以它为准修复 run 状态与远征表交接快照。幂等：已修复（章号一致）直接返回。
+    返回是否发生修复（调用方据此把本步事件标记 migrated、rev+1 原子落库）。
+    """
+    exp_id = rec.get("expedition_id") or run.get("expedition_id")
+    true_chapter = rec.get("chapter")
+    if not exp_id or true_chapter is None:
+        return False
+    if run.get("chapter") == true_chapter:
+        return False  # 已是修复后的结构
+    # 第 1 章不会受影响；只修复章号确实错位的章节 run
+    exp_row = conn.execute("SELECT * FROM expeditions WHERE id=?", (exp_id,)).fetchone()
+    if exp_row is None:
+        # 远征记录缺失（异常档）：至少把 run 章号对齐，保证委托视口自洽
+        run["chapter"] = true_chapter
+        return True
+    chapters_total = exp_row["chapters_total"]
+    run["chapter"] = true_chapter
+    run["chapters_total"] = chapters_total
+
+    accepted_chapter, claimed_chapter = _commission_chapter_maps_conn(conn, exp_id)
+    # 进入本章时已随快照带入的委托 id（create 事件 carry）；真实接取章以交接快照
+    # 边界为准（本章新接取的不在其中，按当前章重算 deadline）。
+    create_carry_ids = set()
+    create_carry_commissions = {}
+    rows = conn.execute(
+        "SELECT payload_json FROM battle_events WHERE run_id=? AND action='create'",
+        (rec.get("id"),),
+    ).fetchall()
+    for r in rows:
+        try:
+            p = json.loads(r["payload_json"])
+        except (ValueError, TypeError):
+            continue
+        if isinstance(p, dict) and isinstance(p.get("carry"), dict):
+            cs = p["carry"].get("commissions", [])
+            create_carry_ids = {c["id"] for c in cs}
+            create_carry_commissions = {c["id"]: c for c in cs}
+            break
+    _repair_commissions_pure(
+        run.get("commissions", []), true_chapter, chapters_total,
+        accepted_chapter=accepted_chapter, claimed_chapter=claimed_chapter,
+        carry_ids=create_carry_ids,
+        carry_boundary=create_carry_commissions, revive_chapter=true_chapter)
+    # 正停在章>=2 商店时，货架未接取挂单也按真实章号重新锚定（与回放重建一致）
+    reanchor_shop_commission_offers(run.get("shop"), true_chapter, chapters_total)
+
+    # 远征表交接快照：当前章 run 持有的 carry 是其来源章的快照。
+    # - 进行中远征：carry 来自上一章通关（origin=本章-1），之后还会再开一章，
+    #   撤销「进入下一章」被误判超期的进行中委托；
+    # - 已结算远征（won/lost）：carry 是本章（终章/战败章）结束时写入的终态快照，
+    #   之后不再开章，只校正章号/期限/领奖记录，不改变失败终态。
+    if exp_row["current_run_id"] == rec.get("id"):
+        # 原始 SQL 行只有 carry_json，解析为内存快照后再修复（同 db._row_to_expedition）
+        exp_dict = {k: exp_row[k] for k in exp_row.keys()}
+        try:
+            exp_dict["carry"] = json.loads(exp_row["carry_json"]) \
+                if exp_row["carry_json"] else None
+        except (ValueError, TypeError):
+            exp_dict["carry"] = None
+        if exp_row["status"] == "in_progress":
+            _repair_expedition_carry_conn(
+                conn, exp_dict, true_chapter - 1,
+                accepted_chapter, claimed_chapter, revive=True)
+        else:
+            _repair_expedition_carry_conn(
+                conn, exp_dict, true_chapter,
+                accepted_chapter, claimed_chapter, revive=False)
+    return True
+
+
 def _claim_allowed_after_chapter(conn, run):
     """章节已通关（run=won）后是否仍可领奖：仅限远征进行中（尚未进入下一章）。
 
@@ -612,6 +866,9 @@ def act(run_id, action):
             # 不可比，事件打 migrated 标记 -> 回放按 legacy 处理本步，后续步骤仍严格校验。
             migrated = _migrate_state(run)
             _ensure_expedition_fields_conn(conn, run, rec)
+            # 2.4.0：修复跨章交接章号错位的受影响旧档（章号/委托期限/领奖记录一致性）
+            if _repair_expedition_chapter_run_conn(conn, run, rec):
+                migrated = True
             ended_before = run["status"] != "in_progress"
             # 章节已通关（won）但远征尚未推进时，仍允许领取已完成委托（领奖后再开新章）；
             # 其余情况下结束的 run 不再接受行动。
@@ -689,7 +946,9 @@ def _apply_action(run, a, action, map_data, grant_unlocks=False):
     if a == "shop_remove":
         return _shop_remove(run, action.get("card"))
     if a == "commission_accept":
-        return _commission_accept(run, action.get("sku"))
+        return _commission_accept(run, action.get("sku"),
+                                  legacy_offer=action.get("_legacy_offer"),
+                                  legacy_ignore_cap=action.get("_legacy_ignore_cap", False))
     if a == "commission_claim":
         return _commission_claim(run, action.get("commission"))
     raise InvalidAction(f"unknown action {a}")
@@ -1116,23 +1375,34 @@ def _find_commission_offer(run, sku):
     return offer
 
 
-def _commission_accept(run, sku):
+def _commission_accept(run, sku, legacy_offer=None, legacy_ignore_cap=False):
     """在商店接取限章委托：免费，接取后挂单移除、委托进入进行中。
 
     委托限张（commission_mod.MAX_ACTIVE，含已完成待领取）；委托随章节交接，
     战斗胜利/商店交易自动推进，领奖走 commission_claim（防重复）。
+
+    legacy_offer（仅回放受影响旧日志时由回放层注入）：旧实现章号错位，修复后
+    重放的挂单与旧挂单可能不再逐项相同；回放层按旧委托内容合成挂单项，使历史
+    接取动作在修复路径上仍可重放，并同步忽略限张（旧超期判定少失败委托时，
+    修复后的持有数可能超过旧的挂单上限）。
     """
-    offer = _find_commission_offer(run, sku)
-    commissions = run.setdefault("commissions", [])
-    active = [c for c in commissions if c["status"] in (commission_mod.ACTIVE, commission_mod.READY)]
-    if len(active) >= commission_mod.MAX_ACTIVE:
-        raise InvalidAction("too many active commissions")
+    if legacy_offer is not None:
+        offer = legacy_offer
+        commissions = run.setdefault("commissions", [])
+    else:
+        offer = _find_commission_offer(run, sku)
+        commissions = run.setdefault("commissions", [])
+        active = [c for c in commissions
+                  if c["status"] in (commission_mod.ACTIVE, commission_mod.READY)]
+        if len(active) >= commission_mod.MAX_ACTIVE:
+            raise InvalidAction("too many active commissions")
     seq = run.get("next_commission_seq", 1)
     run["next_commission_seq"] = seq + 1
     commission = commission_mod.make_commission(seq, offer)
     commissions.append(commission)
+    offers = run["shop"].setdefault("commission_offers", [])
     run["shop"]["commission_offers"] = [
-        o for o in run["shop"]["commission_offers"] if o["signature"] != offer["signature"]
+        o for o in offers if o["signature"] != offer["signature"]
     ]
     run["events_log"].append({
         "at": f"commission:{run['position']}", "accepted": commission["id"],
@@ -1223,18 +1493,17 @@ def resume(run_id):
             state = json.loads(row["state_json"])
             map_data = json.loads(row["map_json"])
             rec = {
+                "id": run_id,
                 "expedition_id": row["expedition_id"] if "expedition_id" in row.keys() else None,
                 "chapter": row["chapter"] if "chapter" in row.keys() else None,
             }
-            if _migrate_state(state):
-                _ensure_expedition_fields_conn(conn, state, rec)
+            structural = _migrate_state(state)
+            _ensure_expedition_fields_conn(conn, state, rec)
+            # 2.4.0：受影响的跨章旧档首次续局同样执行章号/委托一致性修复
+            repaired = _repair_expedition_chapter_run_conn(conn, state, rec)
+            if structural or repaired:
                 # 迁移是幂等的结构升级：无条件落库即可（per-run 锁已串行化，
                 # 多进程下即便并发迁移，写入的也是等价结构），不做 rev 冲突判定。
-                db.save_run_run(conn, run_id, row["status"], row["position"], state)
-                rev = row["rev"] + 1
-            elif state.get("expedition_id") is None and rec["expedition_id"]:
-                # 2.2.0 之前的远征章节档（结构未触发其它迁移项也要补委托字段）
-                _ensure_expedition_fields_conn(conn, state, rec)
                 db.save_run_run(conn, run_id, row["status"], row["position"], state)
                 rev = row["rev"] + 1
             else:
@@ -1268,6 +1537,88 @@ def state_checkpoint(run):
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
+def _create_ckpt_candidates(seed, create_payload):
+    """回放开章：构造「修复后正确初态」与「旧版错误初态」两种候选及其校验点。
+
+    2.4.0 之前的跨章 run 用 carry 里的来源章号覆盖了新章号；create 事件里记录的
+    ckpt 是错误初态的哈希。比对记录值即可识别受影响旧日志：记录命中错误候选、
+    且不等于正确候选 -> 本 run 是受影响章，回放走兼容修复路径。
+    返回 (正确初态, 正确ckpt, 错误ckpt 或 None)。
+    """
+    carry = create_payload.get("carry") if not create_payload.get("_corrupt") else None
+    chapter = create_payload.get("chapter")
+    total = create_payload.get("chapters_total")
+    sim = _new_run_state(
+        seed, carry=carry, chapter=chapter, chapters_total=total,
+        expedition_id=create_payload.get("expedition"))
+    # 状态内的 rules_version 标签在旧版本建局时就是旧串（在线修复不改写它）；
+    # 用 create 事件记录的 ver 还原标签，旧存档哈希才能逐位比对（新档 ver 即当前版）。
+    recorded_ver = create_payload.get("ver")
+    if recorded_ver:
+        sim["rules_version"] = recorded_ver
+    fixed_ckpt = state_checkpoint(sim)
+    buggy_ckpt = None
+    if carry is not None and chapter is not None and chapter > 1:
+        buggy = _new_run_state(
+            seed, carry=carry,
+            chapter=carry.get("chapter"),   # 旧实现：来源章号覆盖新章号
+            chapters_total=carry.get("chapters_total", total),
+            expedition_id=create_payload.get("expedition"))
+        if recorded_ver:
+            buggy["rules_version"] = recorded_ver
+        buggy_ckpt = state_checkpoint(buggy)
+    return sim, fixed_ckpt, buggy_ckpt
+
+
+def _replay_commission_maps(conn, exp_id, run_id):
+    """回放层建立委托章号映射（只读）：有远征用交接快照边界（在线修复同款）；
+    单局回放只补领奖章（本章 commission_claim 动作 -> runs.chapter 权威章号）。"""
+    accepted, claimed = {}, {}
+    if exp_id:
+        accepted, claimed = _commission_chapter_maps_conn(conn, exp_id)
+    row = conn.execute("SELECT chapter FROM runs WHERE id=?", (run_id,)).fetchone()
+    ch = row["chapter"] if row is not None else None
+    if ch is not None:
+        for e in db.load_events(run_id):
+            if e["action"] == "commission_claim":
+                cid = (e.get("payload") or {}).get("commission")
+                if cid:
+                    claimed.setdefault(cid, ch)
+    return accepted, claimed
+
+
+def _legacy_offer_for_accept(run_rec, sku, fixed_chapter, chapters_total, exp_id=None):
+    """回放受影响旧日志时，为旧的 commission_accept 合成修复路径上的挂单项。
+
+    修复点之前的接取都发生在当前章：deadline 按真实章号 fixed_chapter 重算，
+    duration 从本档状态里同 signature 的旧委托反推（旧挂单按章号 1 锚定）；
+    找不到时从 signature 文本解析 kind/target/reward 并按最大时限兜底。
+    """
+    sig = sku.split("commission:", 1)[-1] if sku else ""
+    commissions = (run_rec.get("state") or {}).get("commissions", [])
+    match = next((c for c in commissions if c.get("signature") == sig), None)
+    if match is not None:
+        kind, target, reward = match["kind"], match["target"], dict(match["reward"])
+        duration = _commission_duration(match, 1, chapters_total)
+    else:
+        # 兜底：signature 形如 "battle:2:gold:30" / "trade:3:card:cleave"
+        parts = sig.split(":")
+        try:
+            kind, target = parts[0], int(parts[1])
+        except (ValueError, IndexError):
+            return None
+        if parts[2] == "gold":
+            reward = {"type": "gold", "amount": int(parts[3])}
+        else:
+            reward = {"type": "card", "card": ":".join(parts[3:])}
+        duration = commission_mod.MAX_DURATION
+    deadline = min(chapters_total or fixed_chapter, fixed_chapter + duration)
+    return {
+        "kind": kind, "target": target, "deadline_chapter": deadline,
+        "reward": reward, "signature": sig, "offered_chapter": fixed_chapter,
+    }
+
+
 def replay(run_id):
     """整局可交互回放。
 
@@ -1296,16 +1647,43 @@ def replay(run_id):
          if e.get("action") == "create" and isinstance(e.get("payload"), dict)),
         {},
     )
-    carry = create_payload.get("carry") if not create_payload.get("_corrupt") else None
-    # 远征章节 run：章号/总章数/远征 id 由 create 事件携带，在线与回放同函数重建
-    sim = _new_run_state(
-        seed, carry=carry,
-        chapter=create_payload.get("chapter"),
-        chapters_total=create_payload.get("chapters_total"),
-        expedition_id=create_payload.get("expedition"),
-    )
-    initial_ckpt = state_checkpoint(sim)
+    # 修复后正确初态 + 旧版错误初态两个候选：用记录的 create ckpt 识别受影响旧日志
+    sim, initial_ckpt, buggy_ckpt = _create_ckpt_candidates(seed, create_payload)
+    recorded_initial = (create_payload.get("ckpt")
+                        if not create_payload.get("_corrupt") else None)
+    # 受影响章（记录的是错误初态哈希）：整段走兼容修复——沿修复后的正确路径重放，
+    # 修复点之前的历史步骤记录的是错误状态哈希，按 legacy 跳过逐位比对；修复点
+    # （在线迁移发生的首个动作）及之后严格比对。最终帧与在线修复后的存档一致。
+    legacy_chapter = bool(
+        recorded_initial and buggy_ckpt is not None
+        and recorded_initial == buggy_ckpt and recorded_initial != initial_ckpt)
 
+    fixed_chapter = create_payload.get("chapter")
+    chapters_total = create_payload.get("chapters_total")
+    exp_id = rec.get("expedition_id") or create_payload.get("expedition")
+
+    # 受影响章的委托接取/领奖章号映射与入章携带委托集合（纯修复与在线同款）
+    accepted_chapter, claimed_chapter = {}, {}
+    carry_ids = set()
+    if legacy_chapter:
+        with db.get_conn() as conn:
+            accepted_chapter, claimed_chapter = \
+                _replay_commission_maps(conn, exp_id, run_id)
+        carry = create_payload.get("carry") or {}
+        carry_commissions = carry.get("commissions", [])
+        carry_ids = {c["id"] for c in carry_commissions}
+        # 与在线迁移等价：在重放任何历史动作之前，先把正确初态里随快照带入的委托
+        # 校正（真实接取章/deadline/领奖记录/撤销被旧超期判定误判失败的进行中委托）。
+        # 此后沿修复路径重放：本章新接取经注入的修复挂单项进入，最终帧与在线
+        # 修复后的存档逐位一致；历史 ckpt 记录的是错误状态，按 legacy 跳过比对。
+        _repair_commissions_pure(
+            sim.get("commissions", []), fixed_chapter, chapters_total,
+            accepted_chapter=accepted_chapter,
+            claimed_chapter=claimed_chapter, carry_ids=carry_ids,
+            carry_boundary={c["id"]: c for c in carry_commissions},
+            revive_chapter=fixed_chapter)
+        # 货架未接取挂单同样重新锚定到真实当前章（在线修复同款，保证逐位一致）
+        reanchor_shop_commission_offers(sim.get("shop"), fixed_chapter, chapters_total)
     # 远征章节 run：帧视口携带远征摘要（只读，不阻断回放）
     exp_badge = None
     if rec.get("expedition_id"):
@@ -1316,10 +1694,12 @@ def replay(run_id):
     steps = []
     checks = []          # 每步校验结果
     legacy_steps = 0
+    repaired_steps = 0   # 受影响旧日志的兼容修复步骤（修复点之前，按 legacy 呈现）
     skipped_errors = 0
     versions = set()
     expected_seq = 1     # 序号连续性检查（旧档/异常日志可能有缺口）
     gap_steps = 0
+    post_fix = not legacy_chapter  # 已越过在线迁移点（2.4.0 新事件）-> 恢复严格校验
 
     for ev in events:
         payload = ev.get("payload") or {}
@@ -1330,11 +1710,25 @@ def replay(run_id):
         ver = payload.get("ver") if not corrupt_row else None
         if ver:
             versions.add(ver)
+        # 受影响旧日志的修复点：在线迁移落库步（migrated）或首个 2.4.0 新事件。
+        # 从该步起记录的哈希已对应修复后状态，本步及以后恢复严格校验。
+        at_fix_point = legacy_chapter and not post_fix and (
+            migrated_step or (ver and not _ver_lt(ver, RULES_VERSION)))
+        if at_fix_point:
+            post_fix = True
+        # 修复点之前（不含 create 与修复点本身）记录的是错误状态，按 legacy 处理
+        pre_repair = (legacy_chapter and not post_fix
+                      and ev["action"] != "create" and not at_fix_point)
+        create_of_legacy = (legacy_chapter and ev["action"] == "create"
+                            and not post_fix)
         # 损坏行没有可信版本号，按旧日志处理但仍会因推演失败标注 error
         is_legacy = not ver
-        if is_legacy or migrated_step:
+        skip_ckpt = corrupt_row or migrated_step or pre_repair or create_of_legacy
+        if is_legacy or migrated_step or pre_repair or create_of_legacy:
             legacy_steps += 1
-        recorded = None if (corrupt_row or migrated_step) else payload.get("ckpt")
+        if pre_repair:
+            repaired_steps += 1
+        recorded = None if skip_ckpt else payload.get("ckpt")
         a = ev["action"]
         # 序号缺口不阻断后续推演（可能是旧档缺行），但记录警告便于排障
         gap_warning = None
@@ -1358,6 +1752,15 @@ def replay(run_id):
                 replay_action = dict(payload)
                 if a == "forge" and (is_legacy or _ver_lt(ver, GROWTH_RULES_VERSION)):
                     replay_action["_legacy_forge"] = True
+                # 受影响旧日志在修复点之前的委托接取：修复后挂单与旧挂单不再逐项
+                # 相同，按旧委托内容合成修复路径上的挂单项（放宽旧限张/超期连锁差异）
+                if pre_repair and a == "commission_accept":
+                    offer = _legacy_offer_for_accept(
+                        rec, payload.get("sku"), fixed_chapter, chapters_total,
+                        exp_id=exp_id)
+                    if offer is not None:
+                        replay_action["_legacy_offer"] = offer
+                        replay_action["_legacy_ignore_cap"] = True
                 log = _apply_action(sim, a, replay_action, map_data, grant_unlocks=False)
             except Exception as e:  # 损坏/越权动作不抹掉整段回放：断在此步并标注
                 error = f"{type(e).__name__}: {e}"
@@ -1367,7 +1770,7 @@ def replay(run_id):
         if error:
             status = "error"
         elif not recorded:
-            status = "legacy"          # 旧版日志无校验点：可播放但不保证逐位一致
+            status = "legacy"          # 旧版/修复前日志：可播放但不保证逐位一致
         elif recorded == actual:
             status = "ok"
         else:
@@ -1390,8 +1793,9 @@ def replay(run_id):
             "view": _public_view(sim, map_data, run_id, include_unlocks=False,
                                  expedition=exp_badge),
             "check": status,
-            "legacy": is_legacy or migrated_step,
+            "legacy": is_legacy or migrated_step or pre_repair or create_of_legacy,
             "migrated": migrated_step,
+            "repaired": pre_repair,
             "error": error,
             "warning": gap_warning,
         })
@@ -1415,6 +1819,7 @@ def replay(run_id):
         "verification": {
             "ok": sum(c["status"] == "ok" for c in checks),
             "legacy": sum(c["status"] == "legacy" for c in checks),
+            "repaired": repaired_steps,
             "mismatch": sum(c["status"] == "mismatch" for c in checks),
             "error": sum(c["status"] == "error" for c in checks),
             "seq_gaps": gap_steps,

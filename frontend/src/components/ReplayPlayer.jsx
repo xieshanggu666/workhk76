@@ -177,7 +177,8 @@ export default function ReplayPlayer({ runId, onClose, embedded = false, replayD
           <div className={`replay-verify ${v.final_match ? 'ok' : 'bad'}`}>
             校验点：
             <i className="chk ok">{v.ok} 通过</i>
-            {v.legacy > 0 && <i className="chk legacy">{v.legacy} 旧版</i>}
+            {v.repaired > 0 && <i className="chk legacy" title="旧版跨章章号错位日志，已按 2.4.0 兼容修复">{v.repaired} 修复</i>}
+            {v.legacy > 0 && <i className="chk legacy">{Math.max(0, (v.legacy || 0) - (v.repaired || 0))} 旧版</i>}
             {v.mismatch > 0 && <i className="chk bad">{v.mismatch} 不一致</i>}
             {v.error > 0 && <i className="chk bad">{v.error} 错误</i>}
             <span className="iso">🔒 只读隔离 · 不写存档 · 不发解锁</span>
@@ -195,8 +196,11 @@ export default function ReplayPlayer({ runId, onClose, embedded = false, replayD
             {step?.check === 'error' && (
               <div className="replay-warn">⚠ 第 {step.seq} 步无法重放：{step.error}</div>
             )}
-            {step?.legacy && (
+            {step?.legacy && !step?.repaired && (
               <div className="replay-warn legacy">旧版日志步骤：无校验点，按兼容模式重放（不保证逐位一致）。</div>
+            )}
+            {step?.repaired && (
+              <div className="replay-warn legacy">跨章修复前步骤：该动作录制于旧版（章号错位），按 2.4.0 修复后的正确章号/委托期限兼容重放，最终状态与修复存档一致。</div>
             )}
           </div>
 
@@ -242,7 +246,7 @@ export default function ReplayPlayer({ runId, onClose, embedded = false, replayD
                     {s.summary && <em>{s.summary}</em>}
                   </span>
                   <span className={`tl-chk ${s.check}`}>
-                    {s.check === 'ok' ? '✓' : s.check === 'legacy' ? '旧' : s.check === 'mismatch' ? '⚠' : '✕'}
+                    {s.check === 'ok' ? '✓' : s.check === 'legacy' ? (s.repaired ? '修' : '旧') : s.check === 'mismatch' ? '⚠' : '✕'}
                   </span>
                 </button>
               ))}

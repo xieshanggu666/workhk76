@@ -147,6 +147,15 @@ request_id 幂等含并发同键、expected_rev 状态冲突 409、旧 schema �
   委托 `failed(expired)`（advance 事件携带 expired id 列表），`ready` 委托不超期。
 - 持久化：委托与发号器在 run 状态（`commissions/next_commission_seq/chapter/chapters_total`）
   并进入章节交接快照；在线开章与回放重建共用 `_new_run_state`，逐位校验点一致。
+  2.4.0 修复：交接快照 carry 里的 `chapter` 是「来源章」，开新章时新 run 的章号只认真实
+  入参（旧实现误用 carry 章号，导致第 2 章及以后 run 的章号恒为 1，委托挂单 deadline、
+  剩余期限 `chapters_left`、领奖位置 `claimed_at`、跨章超期判定全部错乱）。受影响旧档首次
+  载入（续局/首行动）时以权威 `runs.chapter` 列修复 run 状态与远征表 carry：重锚委托接取
+  章/期限、修正领奖记录、复活「真实接取章≥2 且修复后期限未到」却被旧逻辑误判超期的进行中
+  委托（第 1 章接取的真实超期失败保持终态）；整章/整程回放通过 create 事件记录的校验点
+  自动识别受影响章，沿修复后的正确路径重放（旧接取动作按修复挂单兼容重建），修复点之前的
+  步骤以 legacy 呈现并跳过逐位哈希比对（`repaired` 计数），修复点之后（含在线迁移后的新
+  动作）仍严格校验，最终帧与在线修复存档逐位一致，全程只读隔离。
 
 ## 设计要点
 - 所有战斗逻辑在服务端（唯一权威），客户端仅播放服务器返回的结算事件 → 续局/回放天然一致。
@@ -188,8 +197,10 @@ request_id 幂等含并发同键、expected_rev 状态冲突 409、旧 schema �
   `act_requests`（request_id → 首次响应，请求级幂等）、
   `expeditions`（远征：状态/章节进度/交接快照 carry_json/rev）、
   `expedition_events`（远征事件：create/chapter_clear/advance/settle，整程回放时间线）。
-- 远征章节 run 的初始状态由 `_new_run_state(seed, carry)` 构造：在线开章与回放重建共用
-  同一函数，交接快照随章节 run 的 create 事件落库，回放无需读取远征表即可逐位复演；
+- 远征章节 run 的初始状态由 `_new_run_state(seed, carry, chapter, chapters_total,
+  expedition_id)` 构造：新 run 的章号/总章数/远征 id 只认真实入参（carry 里的同名字段
+  是「来源章」历史快照，不参与新 run 身份判定）；在线开章与回放重建共用同一函数，交接
+  快照随章节 run 的 create 事件落库，回放无需读取远征表即可逐位复演；
   章节种子 = f（远征种子， 章节号） 确定性派生，各章地图/洗牌独立但可复现。
   交接快照同时携带远征委托（含进度与 ready/claimed/failed 终态）与委托 uid 发号器，
   开新章时先对快照跑超期判定再建章，advance 事件记录 expired 列表，因此委托的
