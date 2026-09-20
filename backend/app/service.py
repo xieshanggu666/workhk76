@@ -23,8 +23,14 @@ from .forging import FORGE_COST, effective_card, node_name, growth_node_cost, va
 # 2.2.0：远征委托（commissions/chapter/chapters_total 进入 run 状态与交接快照）。
 # 2.3.0：卡牌成长树（带前置条件与互斥分支的 DAG 取代三分支可重复锻造；
 #        实例 forges:[分支] -> growth:[{node,cost}]；旧档与旧日志确定性迁移）。
-RULES_VERSION = "2.3.0"
+# 2.4.0：修复远征跨章 run 的章号被交接快照（旧章）覆盖：开新章时章号/总章数
+#        以归属参数（runs/expeditions 权威列）为准，委托的章号/剩余期限/deadline
+#        与领奖记录随之恢复一致；受影响旧档载入时自愈，旧日志按旧语义兼容回放。
+RULES_VERSION = "2.4.0"
 GROWTH_RULES_VERSION = "2.3.0"  # 成长树规则起始版本：更早的 forge 日志走兼容重演
+# 远征章号交接修复起始版本：此前 create 事件重建的跨章 run 会沿用快照旧章号，
+# 回放时按旧语义重建并在首个 >=2.4.0 动作处对齐（兼容受影响存档/日志）。
+CHAPTER_RULES_VERSION = "2.4.0"
 
 
 def _ver_lt(ver, baseline):
@@ -82,6 +88,11 @@ def _new_run_state(seed, carry=None, chapter=None, chapters_total=None, expediti
     金币、生命/能量上限、远征委托全部带入新章，并按 CHAPTER_CLEAR_HEAL_RATIO
     休整回血；进入新章时超期委托在调用方推进（advance）处理。
     chapter/chapters_total/expedition_id 为远征章节 run 的归属信息（普通局为 None）。
+
+    章号归属以显式参数为准：carry 快照是上一章结束时拍的（其 chapter 是旧章号，
+    仅供快照叙事），若让它覆盖新章号会导致跨章 run 的章号恒停在上一章，进而使
+    委托挂单 deadline / 剩余期限 / 领奖章号全部错乱。显式参数缺省时才回退快照，
+    兼容旧快照重建与测试里的直接构造。
     同一组入参必得同一初始状态——在线开章与回放重建共用本函数，天然一致。
     """
     if carry is None:
@@ -99,6 +110,11 @@ def _new_run_state(seed, carry=None, chapter=None, chapters_total=None, expediti
     # 兼容旧章交接快照（2.3.0 之前的 carry 里可能是 forges 结构）
     _normalize_instances(instances)
     max_hp = carry.get("max_health", 75)
+    # 归属章号：显式参数（新章号）优先，快照里的旧章号仅作缺省回退，
+    # 避免跨章 run 被上一章的章号覆盖（委托 deadline/剩余期限/领奖章号都依赖它）。
+    run_chapter = chapter if chapter is not None else carry.get("chapter")
+    run_chapters_total = (chapters_total if chapters_total is not None
+                          else carry.get("chapters_total"))
     return {
         "seed": seed,
         "rules_version": RULES_VERSION,
@@ -117,8 +133,8 @@ def _new_run_state(seed, carry=None, chapter=None, chapters_total=None, expediti
         "commissions": copy.deepcopy(carry.get("commissions", [])),
         # 远征归属（普通局均为 None）；委托挂单/限章判断依赖章号与总章数
         "expedition_id": expedition_id,
-        "chapter": carry.get("chapter", chapter),
-        "chapters_total": carry.get("chapters_total", chapters_total),
+        "chapter": run_chapter,
+        "chapters_total": run_chapters_total,
         "in_battle": False,
         "battle_index": 0,
         "battle": None,
@@ -425,17 +441,31 @@ def advance_expedition(exp_id, request_id=None):
 def _ensure_expedition_fields_conn(conn, run, rec):
     """旧档/2.2.0 之前的远征章节 run：从 runs 归属列与远征表回填委托所需章号字段。
 
-    结构迁移只在内存的 run 状态上补默认值（随本次行动原子落库）；普通局保持 None。
+    同时修复 2.4.0 之前「跨章 run 的章号被交接快照旧章覆盖」的受影响存档：
+    runs.chapter / expeditions 是权威归属，run 状态里的 chapter/chapters_total
+    以它们为准就地纠正（结构迁移，随本次载入/行动原子落库）；普通局保持 None。
+    返回是否发生结构变化（供调用方把本步标记为迁移步）。
     """
+    changed = False
     exp_id = rec.get("expedition_id")
-    if run.get("expedition_id") is None and exp_id:
+    if not exp_id:
+        return changed
+    if run.get("expedition_id") is None:
         run["expedition_id"] = exp_id
-        run["chapter"] = rec.get("chapter")
-        row = conn.execute(
-            "SELECT chapters_total FROM expeditions WHERE id=?", (exp_id,)
-        ).fetchone()
-        if row is not None:
-            run["chapters_total"] = row["chapters_total"]
+        changed = True
+    row = conn.execute(
+        "SELECT chapter, chapters_total FROM expeditions WHERE id=?", (exp_id,)
+    ).fetchone()
+    # runs.chapter 列是该章 run 的权威归属（推进开章时写入新章号）
+    authoritative_chapter = rec.get("chapter")
+    authoritative_total = row["chapters_total"] if row is not None else None
+    if authoritative_chapter is not None and run.get("chapter") != authoritative_chapter:
+        run["chapter"] = authoritative_chapter
+        changed = True
+    if authoritative_total is not None and run.get("chapters_total") != authoritative_total:
+        run["chapters_total"] = authoritative_total
+        changed = True
+    return changed
 
 
 def _claim_allowed_after_chapter(conn, run):
@@ -611,7 +641,9 @@ def act(run_id, action):
             # migrated=True 时本步状态结构与回放起点（已是新结构）不同，校验点天然
             # 不可比，事件打 migrated 标记 -> 回放按 legacy 处理本步，后续步骤仍严格校验。
             migrated = _migrate_state(run)
-            _ensure_expedition_fields_conn(conn, run, rec)
+            # 远征章号自愈也是结构迁移（受影响旧档纠正章号），本步按迁移步落库/回放
+            if _ensure_expedition_fields_conn(conn, run, rec):
+                migrated = True
             ended_before = run["status"] != "in_progress"
             # 章节已通关（won）但远征尚未推进时，仍允许领取已完成委托（领奖后再开新章）；
             # 其余情况下结束的 run 不再接受行动。
@@ -1226,15 +1258,9 @@ def resume(run_id):
                 "expedition_id": row["expedition_id"] if "expedition_id" in row.keys() else None,
                 "chapter": row["chapter"] if "chapter" in row.keys() else None,
             }
-            if _migrate_state(state):
-                _ensure_expedition_fields_conn(conn, state, rec)
-                # 迁移是幂等的结构升级：无条件落库即可（per-run 锁已串行化，
+            if _migrate_state(state) or _ensure_expedition_fields_conn(conn, state, rec):
+                # 迁移/章号自愈是幂等的结构升级：无条件落库即可（per-run 锁已串行化，
                 # 多进程下即便并发迁移，写入的也是等价结构），不做 rev 冲突判定。
-                db.save_run_run(conn, run_id, row["status"], row["position"], state)
-                rev = row["rev"] + 1
-            elif state.get("expedition_id") is None and rec["expedition_id"]:
-                # 2.2.0 之前的远征章节档（结构未触发其它迁移项也要补委托字段）
-                _ensure_expedition_fields_conn(conn, state, rec)
                 db.save_run_run(conn, run_id, row["status"], row["position"], state)
                 rev = row["rev"] + 1
             else:
@@ -1297,14 +1323,39 @@ def replay(run_id):
         {},
     )
     carry = create_payload.get("carry") if not create_payload.get("_corrupt") else None
-    # 远征章节 run：章号/总章数/远征 id 由 create 事件携带，在线与回放同函数重建
-    sim = _new_run_state(
-        seed, carry=carry,
-        chapter=create_payload.get("chapter"),
-        chapters_total=create_payload.get("chapters_total"),
-        expedition_id=create_payload.get("expedition"),
+    # 远征章节 run：章号/总章数/远征 id 由 create 事件携带，在线与回放同函数重建。
+    create_chapter = create_payload.get("chapter")
+    create_total = create_payload.get("chapters_total")
+    # 2.4.0 之前的跨章 create 事件有 bug：在线开章被 carry 里的旧章号覆盖，
+    # 录下的初始态/逐步 ckpt 都是「旧章号」语义。为让受影响日志逐位复演，
+    # 回放起点按旧语义重建（章号回退到 carry），并在首个 >=2.4.0 动作处对齐。
+    legacy_chapter_carry = (
+        carry is not None
+        and create_chapter is not None
+        and _ver_lt(create_payload.get("ver"), CHAPTER_RULES_VERSION)
+        and carry.get("chapter") is not None
+        and carry.get("chapter") != create_chapter
     )
+    if legacy_chapter_carry:
+        sim = _new_run_state(
+            seed, carry=carry,
+            chapter=carry.get("chapter"),
+            chapters_total=carry.get("chapters_total", create_total),
+            expedition_id=create_payload.get("expedition"),
+        )
+    else:
+        sim = _new_run_state(
+            seed, carry=carry, chapter=create_chapter,
+            chapters_total=create_total, expedition_id=create_payload.get("expedition"),
+        )
+    # 还原录制时的规则版本：版本号在建局写入、之后不可变（旧档迁移只补不改），
+    # 且它参与 ckpt 哈希。回放旧版本日志时起点必须是录下的版本号，否则旧档的
+    # 每一帧都会因版本字段误报 mismatch；无版本号的更老日志沿用当前版本（按 legacy）。
+    recorded_create_ver = create_payload.get("ver")
+    if recorded_create_ver:
+        sim["rules_version"] = recorded_create_ver
     initial_ckpt = state_checkpoint(sim)
+    chapter_reconciled = not legacy_chapter_carry  # 仅受影响旧日志需要一次章号对齐
 
     # 远征章节 run：帧视口携带远征摘要（只读，不阻断回放）
     exp_badge = None
@@ -1351,6 +1402,16 @@ def replay(run_id):
             # 建局事件只携带种子；初始状态已在循环外构造，不产生状态变化
             pass
         else:
+            # 受影响旧日志的「章号对齐缝」：旧语义重放到首个 2.4.0（或迁移）动作时，
+            # 先把 run 章号从旧章对齐到权威归属，再应用该动作——与受影响存档在线
+            # 载入时自愈后的状态逐位一致；对齐缝本身按 legacy 处理（两侧语义切换点）。
+            if not chapter_reconciled and (
+                    migrated_step or (ver and not _ver_lt(ver, CHAPTER_RULES_VERSION))):
+                if sim.get("chapter") != create_chapter and create_chapter is not None:
+                    sim["chapter"] = create_chapter
+                if create_total is not None and sim.get("chapters_total") != create_total:
+                    sim["chapters_total"] = create_total
+                chapter_reconciled = True
             try:
                 # 2.3.0 之前（含无版本号）的 forge 日志：旧三分支可重复锻造，
                 # 按成长树默认链兼容重演，避免旧规则下“重复同分支”的合法动作

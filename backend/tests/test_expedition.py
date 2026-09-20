@@ -371,3 +371,130 @@ def test_chapter_run_replay_verifies_from_carry(client):
 def test_expedition_replay_unknown_id_400(client):
     assert client.get("/api/expeditions/nope/replay").status_code == 400
     assert client.get("/api/expeditions/nope").status_code == 400
+
+
+# ---------------- 跨章章号与委托一致性（2.4.0 修复） ----------------
+def _win_and_advance(client, exp_id, rid):
+    _win_chapter(client, rid)
+    r = client.post(f"/api/expeditions/{exp_id}/advance", json={})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_new_chapter_run_state_uses_new_chapter_not_carry(client):
+    """开第 2/3 章时，run 状态章号必须是新章号，而非交接快照里的旧章号。"""
+    data = _create(client, seed=5, chapters=3)
+    exp_id = data["expedition"]["id"]
+    rid = data["run"]["run_id"]
+
+    adv2 = _win_and_advance(client, exp_id, rid)
+    rid2 = adv2["run"]["run_id"]
+    assert db.load_run(rid2)["state"]["chapter"] == 2
+    assert db.load_run(rid2)["state"]["chapters_total"] == 3
+
+    adv3 = _win_and_advance(client, exp_id, rid2)
+    rid3 = adv3["run"]["run_id"]
+    assert db.load_run(rid3)["state"]["chapter"] == 3
+    assert db.load_run(rid3)["state"]["chapters_total"] == 3
+
+
+def test_new_run_state_explicit_chapter_overrides_carry():
+    """_new_run_state：显式章号（新章号）优先于 carry 快照里的旧章号。"""
+    carry = {
+        "deck": [], "card_instances": {}, "next_card_seq": 1,
+        "relics": {}, "gold": 0, "max_health": 75, "health": 40,
+        "chapter": 1, "chapters_total": 3, "commissions": [],
+    }
+    st = service._new_run_state(123, carry=carry, chapter=2, chapters_total=3,
+                                expedition_id="e1")
+    assert st["chapter"] == 2 and st["chapters_total"] == 3
+    # 缺省回退：不传显式章号时才用快照（兼容旧快照直构）
+    st2 = service._new_run_state(123, carry=carry, expedition_id="e1")
+    assert st2["chapter"] == 1 and st2["chapters_total"] == 3
+
+
+def _make_legacy_affected_ch2(seed=77, chapters=2):
+    """构造一份逼真的「2.4.0 前章号 bug 影响」章2存档：
+    create 事件与后续动作均录于 2.3.0 且用旧章号语义，ckpt 按旧状态计算。"""
+    import json
+    created = service.create_expedition(seed=seed, chapters=chapters)
+    exp_id = created["expedition"]["id"]
+    rid1 = created["run"]["run_id"]
+    st = db.load_run(rid1)["state"]
+    st["status"] = "won"
+    st["position"] = "boss"
+    db.save_run(rid1, "won", "boss", st)
+    service.advance_expedition(exp_id)
+    rid2 = db.load_expedition(exp_id)["current_run_id"]
+    rec = db.load_run(rid2)
+    m = rec["map"]
+    cp = db.load_events(rid2)[0]["payload"]
+
+    sim = service._new_run_state(service._chapter_seed(seed, 2), carry=cp["carry"],
+                                 chapter=cp["carry"]["chapter"],
+                                 chapters_total=cp["carry"]["chapters_total"],
+                                 expedition_id=cp["expedition"])
+    sim["rules_version"] = "2.3.0"
+    assert sim["chapter"] == 1  # 旧 bug：章2 run 的章号停在 1
+    with db.transaction() as conn:
+        old_create = dict(cp)
+        old_create["ver"] = "2.3.0"
+        old_create["ckpt"] = service.state_checkpoint(sim)
+        conn.execute("UPDATE battle_events SET payload_json=? WHERE run_id=? AND seq=1",
+                     (json.dumps(old_create, ensure_ascii=False), rid2))
+
+    node = m["routes"]["start"][0]
+    service._apply_action(sim, "choose_node", {"node": node}, m)
+    with db.transaction() as conn:
+        db.append_event_conn(conn, rid2, 2, "choose_node",
+                             {"node": node, "ver": "2.3.0",
+                              "ckpt": service.state_checkpoint(sim)})
+        conn.execute("UPDATE runs SET state_json=?, status=?, position=? WHERE id=?",
+                     (json.dumps(sim, ensure_ascii=False), sim["status"],
+                      sim["position"], rid2))
+    return exp_id, rid2, m, sim, node
+
+
+def test_legacy_affected_save_replays_bit_exact_without_false_mismatch(client):
+    """未修复的受影响旧档：整程回放按旧语义逐位复演，不误报 mismatch。"""
+    exp_id, rid2, m, sim, node = _make_legacy_affected_ch2()
+    rep = client.get(f"/api/runs/{rid2}/replay").json()
+    v = rep["verification"]
+    assert v["mismatch"] == 0 and v["error"] == 0
+    assert [c["status"] for c in v["checks"]] == ["ok", "ok"]
+
+
+def test_legacy_affected_save_self_heals_chapter_on_load(client):
+    """受影响旧档续局时章号自愈为权威归属（runs.chapter=2）。"""
+    exp_id, rid2, m, sim, node = _make_legacy_affected_ch2()
+    assert db.load_run(rid2)["state"]["chapter"] == 1  # 修复前
+    view = client.get(f"/api/runs/{rid2}/resume").json()
+    assert view["expedition"]["chapter"] == 2
+    assert db.load_run(rid2)["state"]["chapter"] == 2
+
+
+def test_healed_legacy_save_replay_reconciles_without_mismatch(client):
+    """自愈后再走一个 2.4.0 在线动作：回放章号在版本缝对齐，之后逐位一致。"""
+    exp_id, rid2, m, sim, node = _make_legacy_affected_ch2()
+    client.get(f"/api/runs/{rid2}/resume")  # 触发自愈落库
+    rec = service.load_run(rid2)
+    candidates = rec["map"]["routes"].get(rec["state"]["position"], [])
+    assert candidates
+    nxt = candidates[0]
+    r = client.post(f"/api/runs/{rid2}/act", json={"action": "choose_node", "node": nxt})
+    assert r.status_code == 200, r.text
+    rep = client.get(f"/api/runs/{rid2}/replay").json()
+    v = rep["verification"]
+    assert v["mismatch"] == 0 and v["error"] == 0
+    assert [c["status"] for c in v["checks"]][0] == "ok"
+
+
+def test_legacy_affected_full_expedition_replay_isolated(client):
+    """受影响旧档所在远征的整程回放：两章均无 mismatch、只读隔离。"""
+    exp_id, rid2, m, sim, node = _make_legacy_affected_ch2()
+    rep = client.get(f"/api/expeditions/{exp_id}/replay").json()
+    assert rep["isolated"] is True
+    for ch in rep["chapters"]:
+        cv = ch["replay"]["verification"]
+        assert cv["mismatch"] == 0 and cv["error"] == 0
+    assert [ch["chapter"] for ch in rep["chapters"]] == [1, 2]

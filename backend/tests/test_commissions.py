@@ -705,6 +705,84 @@ def test_legal_carry_state_matches_replay(client):
     assert replayed == online
 
 
+# ---------------- 跨章章号/剩余期限/领奖记录一致性（2.4.0 修复） ----------------
+def _inject_ready_commission(client, rid, seq, deadline, reward=None, accepted_chapter=1):
+    """在指定 run 注入一个 ready 委托（便于跨章领奖/期限断言）。"""
+    reward = reward or {"type": "gold", "amount": 50}
+    offer = {"kind": BATTLE, "target": 1, "deadline_chapter": deadline,
+             "reward": reward, "signature": f"battle:1:{reward['type']}:{seq}",
+             "offered_chapter": accepted_chapter}
+    q = make_commission(seq, offer)
+    q["status"] = READY
+    q["progress"] = 1
+    rec = service.load_run(rid)
+    rec["state"]["commissions"].append(q)
+    rec["state"]["next_commission_seq"] = seq + 1
+    db.save_run(rid, rec["state"]["status"], rec["state"]["position"], rec["state"])
+    return q["id"]
+
+
+def test_cross_chapter_commission_chapters_left_uses_new_chapter(client):
+    """跨章后委托的剩余期限（chapters_left）必须按新章号计算。"""
+    data = _create(client)
+    exp_id = data["expedition"]["id"]
+    rid = data["run"]["run_id"]
+    qid = _inject_ready_commission(client, rid, 1, deadline=3)
+    _win_chapter(client, rid)
+    adv = client.post(f"/api/expeditions/{exp_id}/advance", json={}).json()
+    rid2 = adv["run"]["run_id"]
+    # 章2：deadline=3 -> 剩余 1 章（修复前章号被当作 1 -> 错误显示剩 2 章）
+    q = next(x for x in adv["run"]["commissions"] if x["id"] == qid)
+    assert q["deadline_chapter"] == 3
+    assert q["chapters_left"] == 1
+    view = client.get(f"/api/runs/{rid2}/resume").json()
+    assert next(x for x in view["commissions"] if x["id"] == qid)["chapters_left"] == 1
+
+
+def test_cross_chapter_claim_records_new_chapter(client):
+    """跨章后领奖，claimed_at 必须记录新章号（修复前误记为上一章）。"""
+    data = _create(client)
+    exp_id = data["expedition"]["id"]
+    rid = data["run"]["run_id"]
+    qid = _inject_ready_commission(client, rid, 1, deadline=3)
+    _win_chapter(client, rid)
+    adv = client.post(f"/api/expeditions/{exp_id}/advance", json={}).json()
+    rid2 = adv["run"]["run_id"]
+    assert _claim(client, rid2, qid).status_code == 200
+    c = next(x for x in service.load_run(rid2)["state"]["commissions"] if x["id"] == qid)
+    assert c["status"] == CLAIMED
+    assert c["claimed_at"].startswith("chapter:2:"), c["claimed_at"]
+
+
+def test_cross_chapter_shop_offers_deadline_uses_new_chapter(client):
+    """第 2 章商店挂单的 deadline 必须基于新章号（>=2），不被旧章号压低。"""
+    data = _create(client)
+    exp_id = data["expedition"]["id"]
+    rid = data["run"]["run_id"]
+    _win_chapter(client, rid)
+    adv = client.post(f"/api/expeditions/{exp_id}/advance", json={}).json()
+    rid2 = adv["run"]["run_id"]
+    # run 状态章号正确：直接核对状态与挂单纯函数
+    st = service.load_run(rid2)["state"]
+    assert st["chapter"] == 2 and st["chapters_total"] == 3
+    offers = generate_offers(4242, st["chapter"], st["chapters_total"], [])
+    assert offers and all(o["deadline_chapter"] >= 2 for o in offers)
+
+
+def test_affected_legacy_ch2_commission_view_self_heals(client):
+    """受 2.4.0 前 bug 影响的章2存档：载入后委托视口章号/剩余期限恢复一致。"""
+    from tests.test_expedition import _make_legacy_affected_ch2
+    exp_id, rid2, m, sim, node = _make_legacy_affected_ch2()
+    # 旧章号语义下手工注入一个 deadline=3 的委托
+    rec = service.load_run(rid2)
+    qid = _inject_ready_commission(client, rid2, 1, deadline=3, accepted_chapter=1)
+    # 修复前：章号=1，错误地显示剩 2 章
+    bad = client.get(f"/api/runs/{rid2}/resume").json()  # 触发自愈
+    q = next(x for x in bad["commissions"] if x["id"] == qid)
+    assert db.load_run(rid2)["state"]["chapter"] == 2
+    assert q["chapters_left"] == 1  # 自愈后按章2计算
+
+
 # ---------------- 纯规则 ----------------
 def test_pure_expire_and_progress_rules():
     offers = generate_offers(77, 1, 3, [])
